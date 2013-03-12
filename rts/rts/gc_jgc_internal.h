@@ -32,6 +32,7 @@ struct s_block {
         union {
                 // A normal block.
                 struct {
+			struct s_cache* cache;
                         unsigned char num_ptrs;
                         unsigned char size;
                         unsigned short num_free;

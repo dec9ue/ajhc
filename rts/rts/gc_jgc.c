@@ -479,6 +479,7 @@ s_alloc(gc_t gc, struct s_cache *sc)
                 assert(pg);
                 pg->flags = sc->flags;
                 pg->color = sc->color;
+		pg->u.pi.cache = sc;
                 pg->u.pi.num_ptrs = sc->num_ptrs;
                 pg->u.pi.size = sc->size;
                 pg->u.pi.next_free = 0;
@@ -516,8 +517,8 @@ new_cache(struct s_arena *arena, unsigned short size, unsigned short num_ptrs)
         sc->num_ptrs = num_ptrs;
         sc->flags = 0;
         size_t excess = BLOCK_SIZE - sizeof(struct s_block);
-        sc->num_entries = (8*excess) / (8*sizeof(uintptr_t)*size + 1) - 1;
-        sc->color = (sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(sc->num_entries) +
+        sc->num_entries = (8*excess) / (8*sizeof(uintptr_t)*size + 2) - 1;
+        sc->color = (sizeof(struct s_block) + 2*(BITARRAY_SIZE_IN_BYTES(sc->num_entries)) +
                         sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
         SLIST_INIT(&sc->blocks);
         SLIST_INIT(&sc->full_blocks);
