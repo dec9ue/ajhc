@@ -15,7 +15,9 @@ static gc_t gc_stack_base;
 
 void gc_perform_gc(gc_t gc) A_STD;
 static bool s_set_used_bit(void *val) A_UNUSED;
+static bool s_set_gc_used_bit(void *val) A_UNUSED;
 static void clear_used_bits(struct s_arena *arena) A_UNUSED;
+static void clear_gc_used_bits(struct s_arena *arena) A_UNUSED;
 static void s_cleanup_blocks(struct s_arena *arena);
 static struct s_block *get_free_block(gc_t gc, struct s_arena *arena);
 static void *jhc_aligned_alloc(unsigned size);
@@ -60,6 +62,14 @@ stack_check(struct stack *s, unsigned n) {
         }
 }
 
+inline static void
+copy_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
+{
+        pg->u.pi.num_free = pg->u.pi.gc_num_free ;
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries);
+        memmove(pg->used,pg->used+bits_in_bytes,bits_in_bytes);
+}
+
 static struct stack root_stack = EMPTY_STACK;
 
 void gc_add_root(gc_t gc, void *root)
@@ -77,7 +87,7 @@ static void
 gc_add_grey(struct stack *stack, entry_t *s)
 {
         VALGRIND_MAKE_MEM_DEFINED(s,(S_BLOCK(s))->u.pi.size * sizeof(uintptr_t));
-        if(gc_check_heap(s) && s_set_used_bit(s))
+        if(gc_check_heap(s) && s_set_gc_used_bit(s))
                 stack->stack[stack->ptr++] = s;
 }
 
@@ -92,7 +102,7 @@ gc_perform_gc(gc_t gc)
         unsigned number_ptr = 0;
         struct stack stack = EMPTY_STACK;
 
-        clear_used_bits(arena);
+        clear_gc_used_bits(arena);
 
         debugf("Setting Roots:");
         stack_check(&stack, root_stack.ptr);
@@ -121,7 +131,7 @@ gc_perform_gc(gc_t gc)
                         if(!IS_LAZY(GETHEAD(FROM_SPTR(ptr)))) {
                                 void *gptr = TO_GCPTR(ptr);
                                 if(gc_check_heap(gptr))
-                                        s_set_used_bit(gptr);
+                                        s_set_gc_used_bit(gptr);
                                 number_redirects++;
                                 debugf(" *");
                                 ptr = (sptr_t)GETHEAD(FROM_SPTR(ptr));
@@ -291,6 +301,26 @@ bitset_find_free(unsigned *next_free,int n,bitarray_t ba[static n]) {
                 assert(i != *next_free);
         } while (1);
 }
+static unsigned
+bitset_find_free2(struct s_cache* sc,unsigned *next_free,int n,bitarray_t ba[static n]) {
+        assert(*next_free < (unsigned)n);
+        unsigned i = *next_free;
+        do {
+                int o = __builtin_ffsl(~ba[i]);
+                if(__predict_true(o)) {
+                        ba[i] |= (1UL << (o - 1));
+                        *next_free = i;
+        		int bitoffset = ((sc->num_entries + 7) / 8)*8;
+			int o2 = o + bitoffset; // new bitpos
+                        // invariant 32*i + o + bitoffset = 32*(i+(o2/32)) + o2%32
+			ba[i+(o2 / (8*sizeof(bitarray_t)))] |= (1UL << ((o2 )%(8*sizeof(bitarray_t))-1));
+			
+                        return (i*BITS_PER_UNIT + (o - 1));
+                }
+                i = (i + 1) % n;
+                assert(i != *next_free);
+        } while (1);
+}
 
 static void *
 jhc_aligned_alloc(unsigned size) {
@@ -369,7 +399,7 @@ s_cleanup_blocks(struct s_arena *arena) {
         struct s_block *pg = SLIST_FIRST(&arena->monolithic_blocks);
         SLIST_INIT(&arena->monolithic_blocks);
         while (pg) {
-                if (pg->used[0]) {
+                if (pg->used[1]) {
                         SLIST_INSERT_HEAD(&arena->monolithic_blocks, pg, link);
                         pg = SLIST_NEXT(pg,link);
                 } else {
@@ -408,6 +438,7 @@ s_cleanup_blocks(struct s_arena *arena) {
                         fpg = NULL;
                 }
                 while(pg) {
+			copy_block_gc_used_bits(sc->num_entries,pg);
                         struct s_block *npg = SLIST_NEXT(pg,link);
                         if(__predict_false(pg->u.pi.num_free == 0)) {
                                 // Add full blockes to the cache's full block list.
@@ -459,8 +490,8 @@ clear_block_used_bits(unsigned num_entries, struct s_block *pg)
 inline static void
 clear_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
 {
-        pg->u.pi.num_free = num_entries;
-        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
+        pg->u.pi.gc_num_free = num_entries;
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries);
         memset(pg->used+bits_in_bytes,0,bits_in_bytes);
         int excess = num_entries % BITS_PER_UNIT;
         // for bitset_find_free to work good, out_of_bound bits must be filled with 1'b1
@@ -469,13 +500,6 @@ clear_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
                 unsigned header =  sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(num_entries);
                 VALGRIND_MAKE_MEM_NOACCESS((char *)pg + header, BLOCK_SIZE - header);
 #endif
-}
-inline static void
-copy_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
-{
-        pg->u.pi.num_free = num_entries;
-        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
-        memmove(pg->used,pg->used+bits_in_bytes,bits_in_bytes);
 }
 /*
  * allocators
@@ -510,13 +534,16 @@ s_alloc(gc_t gc, struct s_cache *sc)
                 if(sc->num_entries != pg->u.pi.num_free)
                         clear_block_used_bits(sc->num_entries, pg);
                 pg->used[0] = 1; //set the first bit
+		
+		// TODO insert gc used bit mark in better way
+		s_set_gc_used_bit(((uintptr_t *)pg)+pg->color);
                 pg->u.pi.num_free = sc->num_entries - 1;
                 return (uintptr_t *)pg + pg->color;
         } else {
                 __builtin_prefetch(pg->used,1);
                 pg->u.pi.num_free--;
                 unsigned next_free = pg->u.pi.next_free;
-                unsigned found = bitset_find_free(&next_free,BITARRAY_SIZE(sc->num_entries),pg->used);
+                unsigned found = bitset_find_free2(sc,&next_free,BITARRAY_SIZE(sc->num_entries),pg->used);
                 pg->u.pi.next_free = next_free;
                 void *val = (uintptr_t *)pg + pg->color + found*pg->u.pi.size;
                 if(__predict_false(0 == pg->u.pi.num_free)) {
@@ -607,15 +634,15 @@ s_set_gc_used_bit(void *val)
         assert(val);
         struct s_block *pg = S_BLOCK(val);
 	int num_entries = pg->u.pi.cache->num_entries;
-        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries);
         unsigned int offset = ((uintptr_t *)val - (uintptr_t *)pg) - pg->color;
         if(__predict_true(BIT_IS_UNSET(pg->used,offset/pg->u.pi.size))) {
                 if (pg->flags & SLAB_MONOLITH) {
-                        pg->used[0] = 1;
+                        pg->used[1] = 1;
                         return (bool)pg->u.m.num_ptrs;
 
                 } else {
-                        BIT_SET(pg->used,offset/pg->u.pi.size);
+                        BIT_SET(pg->used+bits_in_bytes,offset/pg->u.pi.size);
                         pg->u.pi.num_free--;
                         return (bool)pg->u.pi.num_ptrs;
                 }

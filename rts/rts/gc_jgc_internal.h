@@ -36,6 +36,7 @@ struct s_block {
                         unsigned char num_ptrs;
                         unsigned char size;
                         unsigned short num_free;
+                        unsigned short gc_num_free;
                         unsigned short next_free;
                 } pi;
                 // A monolithic block.
