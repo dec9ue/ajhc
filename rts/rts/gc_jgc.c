@@ -233,11 +233,12 @@ static heap_t A_STD
 s_monoblock(struct s_arena *arena, unsigned size, unsigned nptrs, unsigned flags) {
         struct s_block *b = jhc_aligned_alloc(size * sizeof(uintptr_t));
         b->flags = flags | SLAB_MONOLITH;
-        b->color = (sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(1) +
+        b->color = (sizeof(struct s_block) + 2*(BITARRAY_SIZE_IN_BYTES(1)) +
                     sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
         b->u.m.num_ptrs = nptrs;
         SLIST_INSERT_HEAD(&arena->monolithic_blocks, b, link);
         b->used[0] = 1;
+        b->used[1] = 0;
         return (void *)b + b->color*sizeof(uintptr_t);
 }
 
@@ -447,6 +448,7 @@ clear_block_used_bits(unsigned num_entries, struct s_block *pg)
         pg->u.pi.num_free = num_entries;
         memset(pg->used,0,BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]));
         int excess = num_entries % BITS_PER_UNIT;
+        // for bitset_find_free to work good, out_of_bound bits must be filled with 1'b1
         pg->used[BITARRAY_SIZE(num_entries) - 1] = ~((1UL << excess) - 1);
 #if JHC_VALGRIND
                 unsigned header =  sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(num_entries);
@@ -454,6 +456,27 @@ clear_block_used_bits(unsigned num_entries, struct s_block *pg)
 #endif
 }
 
+inline static void
+clear_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
+{
+        pg->u.pi.num_free = num_entries;
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
+        memset(pg->used+bits_in_bytes,0,bits_in_bytes);
+        int excess = num_entries % BITS_PER_UNIT;
+        // for bitset_find_free to work good, out_of_bound bits must be filled with 1'b1
+        pg->used[BITARRAY_SIZE(num_entries) +bits_in_bytes - 1] = ~((1UL << excess) - 1);
+#if JHC_VALGRIND
+                unsigned header =  sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(num_entries);
+                VALGRIND_MAKE_MEM_NOACCESS((char *)pg + header, BLOCK_SIZE - header);
+#endif
+}
+inline static void
+copy_block_gc_used_bits(unsigned num_entries, struct s_block *pg)
+{
+        pg->u.pi.num_free = num_entries;
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
+        memmove(pg->used,pg->used+bits_in_bytes,bits_in_bytes);
+}
 /*
  * allocators
  */
@@ -542,9 +565,63 @@ clear_used_bits(struct s_arena *arena)
         }
 }
 
+// copy all used gc bits to used bits, must be followed by a marking phase.
+static void
+copy_used_bits(struct s_arena *arena)
+{
+        struct s_block *pg;
+        SLIST_FOREACH(pg, &arena->monolithic_blocks, link){
+            pg->used[0] = pg->used[1];
+        }
+        struct s_cache *sc = SLIST_FIRST(&arena->caches);
+        for(;sc;sc = SLIST_NEXT(sc,next)) {
+                SLIST_FOREACH(pg, &sc->blocks, link)
+                    copy_block_gc_used_bits(sc->num_entries,pg);
+                SLIST_FOREACH(pg, &sc->full_blocks, link)
+                    copy_block_gc_used_bits(sc->num_entries,pg);
+        }
+}
+
+// clear all used bits, must be followed by a marking phase.
+static void
+clear_gc_used_bits(struct s_arena *arena)
+{
+        struct s_block *pg;
+        SLIST_FOREACH(pg, &arena->monolithic_blocks, link)
+            pg->used[1] = 0;
+        struct s_cache *sc = SLIST_FIRST(&arena->caches);
+        for(;sc;sc = SLIST_NEXT(sc,next)) {
+                SLIST_FOREACH(pg, &sc->blocks, link)
+                    clear_block_gc_used_bits(sc->num_entries,pg);
+                SLIST_FOREACH(pg, &sc->full_blocks, link)
+                    clear_block_gc_used_bits(sc->num_entries,pg);
+        }
+}
 // Set a used bit. returns true if the tagged node should be scanned by the GC.
 // this happens when the used bit was not previously set and the node contains
 // internal pointers.
+
+static bool
+s_set_gc_used_bit(void *val)
+{
+        assert(val);
+        struct s_block *pg = S_BLOCK(val);
+	int num_entries = pg->u.pi.cache->num_entries;
+        int bits_in_bytes = BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]);
+        unsigned int offset = ((uintptr_t *)val - (uintptr_t *)pg) - pg->color;
+        if(__predict_true(BIT_IS_UNSET(pg->used,offset/pg->u.pi.size))) {
+                if (pg->flags & SLAB_MONOLITH) {
+                        pg->used[0] = 1;
+                        return (bool)pg->u.m.num_ptrs;
+
+                } else {
+                        BIT_SET(pg->used,offset/pg->u.pi.size);
+                        pg->u.pi.num_free--;
+                        return (bool)pg->u.pi.num_ptrs;
+                }
+        }
+        return false;
+}
 
 static bool
 s_set_used_bit(void *val)
