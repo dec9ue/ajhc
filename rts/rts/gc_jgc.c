@@ -480,6 +480,7 @@ s_alloc(gc_t gc, struct s_cache *sc)
                 pg->flags = sc->flags;
                 pg->color = sc->color;
                 pg->u.pi.num_ptrs = sc->num_ptrs;
+                pg->u.pi.num_entries = sc->num_entries;
                 pg->u.pi.size = sc->size;
                 pg->u.pi.next_free = 0;
                 SLIST_INSERT_HEAD(&sc->blocks,pg,link);
